@@ -1,32 +1,33 @@
 # Force Uninstall with SCCM Compliance Reset
 
-A PowerShell script for forcibly removing stubborn software from Windows endpoints when standard uninstall methods — both automated (SCCM) and manual — have already failed. After removal it triggers an SCCM Machine Policy refresh and re-evaluates all Configuration Baselines so the management console reflects the correct state immediately.
+## Overview
+A PowerShell script for forcibly removing stubborn software from Windows endpoints when standard uninstall methods — Add/Remove Programs, SCCM application deployment, and vendor uninstallers — have all already failed. After removal, it triggers an SCCM Machine Policy refresh and re-evaluates all Configuration Baselines so the management console reflects the correct compliance state immediately, without waiting for the next scheduled scan.
 
-![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-blue?logo=powershell) ![Platform](https://img.shields.io/badge/Platform-Windows-lightgrey?logo=windows) ![SCCM](https://img.shields.io/badge/SCCM-Optional-orange) ![License](https://img.shields.io/badge/License-MIT-green)
+## Problem It Solves
+In managed enterprise environments, software removals occasionally get completely stuck. The application's own uninstaller fails silently, SCCM continues to report the software as installed, and manual removal through the Control Panel either errors out or appears to succeed but leaves behind registry entries that keep it showing as installed. This script was written to break that cycle by bypassing the uninstaller dependency entirely — reading uninstall metadata directly from the registry, terminating all related processes first to clear file locks, and forcing the management agent to re-evaluate compliance immediately after removal.
 
-## Problem This Solves
+## Key Features
+- Kills all related processes before uninstall to clear file and registry locks
+- Discovers installed products by registry keyword match — no hardcoded GUIDs
+- Handles both MSI and EXE installer types with correct silent-removal flags
+- Verifies removal by re-querying the registry after each product
+- Triggers SCCM Machine Policy refresh and Configuration Baseline re-evaluation post-removal
+- Gracefully skips SCCM steps if the SCCM client is not present
+- Accepts `-SoftwareKeyword` and `-ProcessKeywords` parameters — works for any application
 
-In managed enterprise environments, software removals occasionally get stuck — the application's own uninstaller fails silently, SCCM reports the software as still installed, and manual uninstall through Add/Remove Programs either errors out or appears to succeed but leaves registry entries behind.
+## Technologies Used
+- PowerShell 5.1+
+- Windows Registry (`HKLM:\SOFTWARE\...\Uninstall`)
+- WMI (`Win32_Process`) for process termination
+- `MsiExec.exe` and EXE silent-uninstall invocation
+- SCCM Client WMI namespace (`root\CCM`)
 
-This script was written to remediate exactly that scenario across a fleet of managed Windows endpoints. It works by:
+## Example Use Case
+A managed enterprise endpoint has a version of Google Chrome that failed to uninstall through SCCM three times. The SCCM console still reports it as installed, blocking deployment of the approved version. Running this script locally (or delivered via SCCM script, PsExec, or WMI remote process creation) terminates all Chrome processes, removes the application via its registry-sourced MSI GUID, and forces SCCM to re-evaluate compliance — the console shows the application as absent within minutes, unblocking the redeployment.
 
-1. **Killing all related processes** before attempting removal, eliminating file-lock failures
-2. **Reading uninstall metadata directly from the registry** rather than relying on the application's own remove entry in Programs & Features
-3. **Handling both MSI and EXE installers** with the correct silent-uninstall flags
-4. **Verifying removal** by re-querying the registry after each product
-5. **Forcing SCCM to re-check compliance** immediately rather than waiting for the next scheduled inventory cycle
+## How to Run
 
-## Requirements
-
-| Requirement | Detail |
-|-------------|--------|
-| PowerShell | 5.1 or later |
-| Permissions | Local administrator on the target host |
-| SCCM client | Optional — steps 4–5 are skipped gracefully if not installed |
-
-## Usage
-
-Run directly on the target host (locally, via SCCM script delivery, PsExec, or a WMI process invocation):
+Run directly on the target host — locally, via SCCM script delivery, PsExec, or WMI remote process invocation:
 
 ```powershell
 # Default — targets all "Google" products
@@ -35,18 +36,16 @@ Run directly on the target host (locally, via SCCM script delivery, PsExec, or a
 # Target a different application
 .\Invoke-ForceUninstall.ps1 -SoftwareKeyword "Firefox" -ProcessKeywords "Firefox"
 
-# Verbose output (shows each PID terminated and baseline evaluated)
+# Verbose output — shows each PID terminated and each baseline evaluated
 .\Invoke-ForceUninstall.ps1 -Verbose
 ```
 
-### Parameters
-
 | Parameter | Default | Description |
-|-----------|---------|-------------|
+|---|---|---|
 | `-SoftwareKeyword` | `"Google"` | Substring matched against registry `DisplayName` entries |
 | `-ProcessKeywords` | `@("Chrome","Google")` | Process name substrings to terminate before uninstalling |
 
-### Example Output
+## Example Output
 
 ```
 Terminating 3 process(es) matching 'Chrome'...
@@ -62,34 +61,14 @@ Re-evaluating SCCM Configuration Baselines...
 Done.
 ```
 
-## How It Works
+## Security Notes
+- Requires **local administrator rights** on the target host
+- Use a dedicated service account with scoped admin rights rather than domain admin credentials for bulk delivery
+- The installer command is constructed from registry data — validate the target keyword to avoid matching and removing unintended software
+- Authorized use only — run only against systems and software you are authorized to manage
 
-### Step 1 — Process termination
-Queries `Win32_Process` via WMI for any running process whose name contains the keyword and calls `Terminate()`. This releases file handles that would otherwise block the uninstaller.
-
-### Step 2 — Registry discovery
-Searches both the 64-bit and 32-bit uninstall hives:
-- `HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall`
-- `HKLM:\SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall`
-
-### Step 3 — Silent uninstall (MSI and EXE)
-| Installer type | Detection | Command |
-|----------------|-----------|---------|
-| MSI | `UninstallString` starts with `MsiExec.exe` | `MsiExec.exe /X {GUID} /qn` |
-| EXE | All others | `<uninstaller.exe> /S` |
-
-For MSI products, `/I` (install) in the uninstall string is replaced with `/X` (remove).
-
-### Step 4 — SCCM Machine Policy refresh
-Invokes `SMS_CLIENT.TriggerSchedule` with the **Machine Policy Retrieval & Evaluation** schedule ID (`{00000000-0000-0000-0000-000000000121}`). This tells the SCCM agent to immediately fetch updated policy from the management point.
-
-### Step 5 — Configuration Baseline re-evaluation
-Enumerates all `SMS_DesiredConfiguration` objects and calls `TriggerEvaluation()` on each. This forces the SCCM client to report current compliance state without waiting for its next scheduled scan window.
-
-## Pairing with Remote Deployment
-
-This script is designed to run **locally** on the target. To push it to remote hosts, use [Deploy-Software.ps1](https://github.com/bwjackson87/remote-software-deploy) or a similar WMI-based remote execution mechanism to invoke it without requiring WinRM.
-
-## License
-
-MIT — see [LICENSE](LICENSE) for details.
+## Lessons Learned
+- EXE uninstallers require passing `/S` for silent removal, while MSI products require replacing `/I` (install) with `/X` (remove) in the uninstall string — treating all products the same causes roughly half of removals to fail or prompt interactively
+- Searching both `HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall` and the `Wow6432Node` equivalent is necessary — 32-bit applications installed on 64-bit Windows register only in the 32-bit hive, and will be missed without it
+- SCCM's next scheduled compliance scan can be hours away — triggering `TriggerEvaluation()` on each `SMS_DesiredConfiguration` baseline immediately after removal eliminates the console lag that causes re-deployment attempts to be blocked by stale data
+- Pairing this script with [remote-software-deploy](https://github.com/bwjackson87/remote-software-deploy) enables a full remove-then-redeploy workflow without requiring WinRM on the target
